@@ -344,6 +344,10 @@ GooseRelayVPN/
 
 ---
 
+## Special Thanks
+
+Special thanks to [@abolix](https://github.com/abolix) for making this project possible.
+
 ## License
 
 MIT
