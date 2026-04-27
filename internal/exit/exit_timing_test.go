@@ -169,6 +169,7 @@ func TestDrainAll_RespectsBatchFrameCap(t *testing.T) {
 			sess := session.New(id, "x:1", false)
 			sess.EnqueueTx([]byte("x"))
 			s.sessions[id] = sess
+			s.txReady[id] = struct{}{}
 		}
 		frames := s.drainAll()
 		expected := total
@@ -191,6 +192,7 @@ func TestDrainAll_RespectsBatchFrameCap(t *testing.T) {
 			sess := session.New(id, "x:1", false)
 			sess.EnqueueTx([]byte("x"))
 			s.sessions[id] = sess
+			s.txReady[id] = struct{}{}
 		}
 		frames := s.drainAll()
 		if len(frames) != maxDrainFramesPerBatchBusy {

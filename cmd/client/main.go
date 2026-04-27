@@ -118,7 +118,7 @@ func main() {
 
 	cfg, err := config.LoadClient(*configPath)
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		log.Fatalf("%v", err)
 	}
 	log.Printf("[client] GooseRelayVPN client starting")
 	log.Printf("[client] config loaded from %s", *configPath)
@@ -145,6 +145,21 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Pre-flight check: one-shot end-to-end probe so users see actionable
+	// errors at startup instead of cryptic mid-session failures.
+	log.Printf("[client] running pre-flight check (Apps Script reachable, VPS reachable, key matches)…")
+	diagCtx, cancelDiag := context.WithTimeout(ctx, 20*time.Second)
+	if err := carr.Diagnose(diagCtx); err != nil {
+		log.Printf("[client] pre-flight FAILED:")
+		for _, line := range strings.Split(err.Error(), "\n") {
+			log.Printf("[client]   %s", line)
+		}
+		log.Printf("[client] continuing anyway — the issue may be transient or recover on its own")
+	} else {
+		log.Printf("[client] pre-flight OK: relay healthy, AES key matches end-to-end")
+	}
+	cancelDiag()
 
 	go func() {
 		if err := carr.Run(ctx); err != nil && ctx.Err() == nil {

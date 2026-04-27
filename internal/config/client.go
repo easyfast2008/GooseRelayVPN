@@ -5,7 +5,9 @@ package config
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/url"
 	"os"
@@ -126,16 +128,45 @@ func normalizeRelayURL(v string) (string, error) {
 	return u.String(), nil
 }
 
+// validateDeploymentID checks that the value looks like an Apps Script
+// deployment ID and produces a hint when it looks like a common copy-paste
+// mistake. The exact format Google uses isn't documented, but every observed
+// ID starts with "AKfycb" and is 50+ characters long.
+func validateDeploymentID(id string) error {
+	if id == "" {
+		return errors.New("empty value in script_keys")
+	}
+	if id == "REPLACE_WITH_DEPLOYMENT_ID" || id == "OPTIONAL_SECOND_DEPLOYMENT_ID" {
+		return errors.New("script_keys still contains the placeholder text from client_config.example.json — replace it with your real Deployment ID (see README Step 5)")
+	}
+	if strings.Contains(id, "/edit") || strings.Contains(id, "script.google.com/d/") {
+		return errors.New("this looks like the Apps Script *editor* URL, not a Deployment ID. Open the deployment from Deploy → Manage deployments, click the deployed Web App URL, and copy the long string between /s/ and /exec")
+	}
+	if strings.ContainsAny(id, " \t\n\r") {
+		return errors.New("script_keys value contains whitespace — paste the Deployment ID without spaces or line breaks")
+	}
+	if !strings.HasPrefix(id, "AKfycb") {
+		return errors.New("Apps Script Deployment IDs start with 'AKfycb'. You may have pasted the script ID (from the editor) instead of the Deployment ID. After deploying, open Deploy → Manage deployments and copy the ID from the Web App URL")
+	}
+	if len(id) < 50 {
+		return fmt.Errorf("Deployment ID looks too short (%d chars; expected ~70). It may be truncated — re-copy from Deploy → Manage deployments", len(id))
+	}
+	return nil
+}
+
 // LoadClient reads and validates a client config file.
 func LoadClient(path string) (*Client, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("config: read %s: %w", path, err)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("config file %q not found.\n  Fix: copy the example and edit it:\n      cp client_config.example.json %s", path, path)
+		}
+		return nil, fmt.Errorf("cannot read config %q: %w", path, err)
 	}
 
 	var f clientFile
 	if err := json.Unmarshal(b, &f); err != nil {
-		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+		return nil, fmt.Errorf("config %q is not valid JSON: %v\n  Common causes: missing comma between fields, trailing comma after the last field, unclosed quote, or a typo in a field name", path, err)
 	}
 
 	listenHost := firstNonEmpty(f.SocksHost, "127.0.0.1")
@@ -144,14 +175,14 @@ func LoadClient(path string) (*Client, error) {
 		listenPort = 1080
 	}
 	if listenPort < 1 || listenPort > 65535 {
-		return nil, fmt.Errorf("config: socks_port out of range (got %d)", listenPort)
+		return nil, fmt.Errorf("socks_port %d is out of range (must be 1-65535)", listenPort)
 	}
 
 	relayURLs := make([]string, 0, len(f.RelayURLs))
 	for _, raw := range f.RelayURLs {
 		normalized, nerr := normalizeRelayURL(raw)
 		if nerr != nil {
-			return nil, fmt.Errorf("config: %w", nerr)
+			return nil, nerr
 		}
 		if normalized != "" {
 			relayURLs = append(relayURLs, normalized)
@@ -160,12 +191,15 @@ func LoadClient(path string) (*Client, error) {
 	relayURLs = dedupeStrings(relayURLs)
 
 	key := strings.TrimSpace(f.TunnelKey)
+	if key == "" || key == "REPLACE_WITH_OUTPUT_OF_scripts_gen-key.sh" {
+		return nil, fmt.Errorf("tunnel_key is empty or still the placeholder text in %s.\n  Fix: generate a key with 'bash scripts/gen-key.sh' and paste the 64-character output into the tunnel_key field. The same value must be in server_config.json", path)
+	}
 	if len(key) != 64 {
-		return nil, fmt.Errorf("config: tunnel_key must be 64 hex chars (got %d)", len(key))
+		return nil, fmt.Errorf("tunnel_key must be exactly 64 hex characters (got %d) in %s.\n  Fix: generate a fresh key with 'bash scripts/gen-key.sh' and paste the full output. Use the SAME value in client_config.json and server_config.json", len(key), path)
 	}
 	raw, err := hex.DecodeString(key)
 	if err != nil || len(raw) != 32 {
-		return nil, fmt.Errorf("config: tunnel_key must be valid 64-char hex AES-256 key")
+		return nil, fmt.Errorf("tunnel_key in %s contains non-hex characters.\n  Valid characters are 0-9 and a-f. Generate a fresh key with 'bash scripts/gen-key.sh' and copy it carefully — no spaces, quotes, or extra newlines", path)
 	}
 
 	useFronting := len(relayURLs) == 0
@@ -179,16 +213,19 @@ func LoadClient(path string) (*Client, error) {
 		googleIP = net.JoinHostPort(googleHost, strconv.Itoa(googlePort))
 		sniHost = firstNonEmpty(f.SNI, "www.google.com")
 
+		if len(f.ScriptKeys) == 0 {
+			return nil, fmt.Errorf("script_keys is empty in %s.\n  Fix: deploy apps_script/Code.gs as a Web App with Access: Anyone, then paste the Deployment ID into the script_keys array. See README Step 5", path)
+		}
+
 		deploymentIDs := make([]string, 0, len(f.ScriptKeys))
-		for _, raw := range f.ScriptKeys {
-			if deploymentID := normalizeDeploymentID(raw); deploymentID != "" {
-				deploymentIDs = append(deploymentIDs, deploymentID)
+		for i, raw := range f.ScriptKeys {
+			deploymentID := normalizeDeploymentID(raw)
+			if err := validateDeploymentID(deploymentID); err != nil {
+				return nil, fmt.Errorf("script_keys[%d] is invalid: %v", i, err)
 			}
+			deploymentIDs = append(deploymentIDs, deploymentID)
 		}
 		deploymentIDs = dedupeStrings(deploymentIDs)
-		if len(deploymentIDs) == 0 {
-			return nil, fmt.Errorf("config: either relay_urls or script_keys is required")
-		}
 
 		scriptURLs = make([]string, 0, len(deploymentIDs))
 		for _, deploymentID := range deploymentIDs {

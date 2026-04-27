@@ -147,6 +147,15 @@ func (s *Session) HasPendingTx() bool {
 	return s.synNeeded || len(s.txBuf) > 0 || (s.closeReq && !s.finSent)
 }
 
+// HasPendingSYN reports whether the next drain will emit a SYN frame.
+// Used by the carrier to prioritise new-connection setup over ongoing data
+// transfers so a large upload/download cannot delay connection establishment.
+func (s *Session) HasPendingSYN() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.synNeeded
+}
+
 // IsDone reports whether both FIN frames (sent and received) have flowed,
 // OR whether we sent our FIN but the peer's FIN never arrived within
 // sessionFinalTimeout. The timeout prevents orphaned sessions from accumulating

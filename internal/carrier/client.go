@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kianmhz/GooseRelayVPN/internal/frame"
@@ -18,8 +19,10 @@ import (
 
 const (
 	// MaxFramePayload caps the bytes per frame; larger writes are chunked.
-	// Kept small so a single Apps Script POST stays well under any limit.
-	MaxFramePayload = 128 * 1024
+	// Raised from 128KB: single-seal means no per-frame crypto cost, so fewer
+	// larger frames are strictly better (less length-prefix overhead, fewer
+	// Unmarshal calls). Must match the value in internal/exit/exit.go.
+	MaxFramePayload = 256 * 1024
 
 	// pollIdleSleep is the breather between polls when nothing is happening,
 	// to avoid busy-looping if the server returns instantly with empty bodies.
@@ -77,7 +80,14 @@ const numPollWorkers = 3
 // if all workers enter them at once, newly queued SYN/data frames must wait
 // for a worker to return, causing 8s/16s latency spikes. Keep one long-poll
 // for downstream push, and leave the rest of workers available for outbound TX.
-const maxConcurrentIdlePolls = 1
+// maxConcurrentIdlePollsDownload raises the cap when txReady is empty: in
+// pure-download mode (video, large files) there is no outbound TX to reserve
+// workers for, so all-but-one workers can long-poll concurrently for better
+// downstream throughput.
+const (
+	maxConcurrentIdlePolls         = 1
+	maxConcurrentIdlePollsDownload = numPollWorkers - 1
+)
 
 // waker is a broadcast notifier: Broadcast() wakes all goroutines currently
 // blocked on C() simultaneously, unlike a buffered chan which only wakes one.
@@ -122,7 +132,22 @@ type Client struct {
 	idlePollMu       sync.Mutex
 	idlePollInFlight int
 
-	wake *waker // broadcasts to all idle poll goroutines simultaneously
+	wake  *waker // broadcasts to all idle poll goroutines simultaneously
+	stats clientStats
+}
+
+// clientStats holds atomic counters surfaced periodically by statsLoop.
+// All fields are uint64 so they can be Load()ed without locking.
+type clientStats struct {
+	framesOut     atomic.Uint64
+	framesIn      atomic.Uint64
+	bytesOut      atomic.Uint64
+	bytesIn       atomic.Uint64
+	pollsOK       atomic.Uint64
+	pollsFail     atomic.Uint64
+	rstFromServer atomic.Uint64
+	sessionsOpen  atomic.Uint64
+	sessionsClose atomic.Uint64
 }
 
 // New constructs a Client. The HTTP client is preconfigured for domain
@@ -183,6 +208,7 @@ func (c *Client) NewSession(target string) *session.Session {
 	c.sessions[id] = s
 	c.txReady[id] = struct{}{} // SYN is pending immediately on creation
 	c.mu.Unlock()
+	c.stats.sessionsOpen.Add(1)
 	c.kick()
 	return s
 }
@@ -200,6 +226,12 @@ func (c *Client) Run(ctx context.Context) error {
 			c.runWorker(ctx)
 		}()
 	}
+	// Periodic stats line so an operator can spot trends without grepping.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.runStatsLoop(ctx)
+	}()
 	wg.Wait()
 	return ctx.Err()
 }
@@ -239,11 +271,36 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 	}
 	isIdlePoll := len(frames) == 0
 	if isIdlePoll {
-		if !c.acquireIdlePollSlot() {
+		// In pure-download mode (txReady empty) all workers can long-poll
+		// concurrently; there is no TX to reserve a free worker for.
+		c.mu.Lock()
+		idleCap := maxConcurrentIdlePolls
+		if len(c.txReady) == 0 {
+			idleCap = maxConcurrentIdlePollsDownload
+		}
+		c.mu.Unlock()
+		if !c.acquireIdlePollSlot(idleCap) {
 			return false
 		}
 		defer c.releaseIdlePollSlot()
 	}
+
+	// Stats: classify poll outcome on return so callers don't have to remember
+	// to bump counters at every terminal point inside the retry loop.
+	var (
+		attempted bool
+		pollOK    bool
+	)
+	defer func() {
+		if !attempted {
+			return
+		}
+		if pollOK {
+			c.stats.pollsOK.Add(1)
+		} else {
+			c.stats.pollsFail.Add(1)
+		}
+	}()
 
 	body, err := frame.EncodeBatch(c.aead, frames)
 	if err != nil {
@@ -271,6 +328,7 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 			return false
 		}
 		req.Header.Set("Content-Type", "text/plain")
+		attempted = true
 
 		resp, err := c.http.Do(req)
 		if err != nil {
@@ -301,6 +359,8 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 
 		if resp.StatusCode == http.StatusNoContent || len(respBody) == 0 {
 			c.markEndpointSuccess(endpointIdx)
+			pollOK = true
+			countFrameBytes(&c.stats.framesOut, &c.stats.bytesOut, frames)
 			return len(frames) > 0
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -346,10 +406,27 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 			c.routeRx(f)
 		}
 		c.markEndpointSuccess(endpointIdx)
+		pollOK = true
+		countFrameBytes(&c.stats.framesOut, &c.stats.bytesOut, frames)
+		countFrameBytes(&c.stats.framesIn, &c.stats.bytesIn, rxFrames)
 		return len(frames) > 0 || len(rxFrames) > 0
 	}
 
 	return false
+}
+
+// countFrameBytes adds the count and total payload size of frames to two
+// atomic counters. Centralised so the call sites in pollOnce stay terse.
+func countFrameBytes(frameCounter, byteCounter *atomic.Uint64, frames []*frame.Frame) {
+	if len(frames) == 0 {
+		return
+	}
+	var bytes uint64
+	for _, f := range frames {
+		bytes += uint64(len(f.Payload))
+	}
+	frameCounter.Add(uint64(len(frames)))
+	byteCounter.Add(bytes)
 }
 
 func (c *Client) pickRelayEndpoint() (int, string) {
@@ -385,21 +462,29 @@ func (c *Client) pickRelayEndpoint() (int, string) {
 
 func (c *Client) markEndpointSuccess(endpointIdx int) {
 	c.endpointMu.Lock()
-	defer c.endpointMu.Unlock()
 	if endpointIdx < 0 || endpointIdx >= len(c.endpoints) {
+		c.endpointMu.Unlock()
 		return
 	}
-	c.endpoints[endpointIdx].failCount = 0
-	c.endpoints[endpointIdx].blacklistedTill = time.Time{}
+	ep := &c.endpoints[endpointIdx]
+	wasFailing := ep.failCount > 0
+	url := ep.url
+	ep.failCount = 0
+	ep.blacklistedTill = time.Time{}
+	c.endpointMu.Unlock()
+	if wasFailing {
+		log.Printf("[carrier] endpoint %s recovered (back in rotation)", shortScriptKey(url))
+	}
 }
 
 func (c *Client) markEndpointFailure(endpointIdx int) {
 	c.endpointMu.Lock()
-	defer c.endpointMu.Unlock()
 	if endpointIdx < 0 || endpointIdx >= len(c.endpoints) {
+		c.endpointMu.Unlock()
 		return
 	}
 	ep := &c.endpoints[endpointIdx]
+	wasHealthy := ep.failCount == 0
 	ep.failCount++
 	step := ep.failCount - 1
 	if step > endpointBlacklistMaxStep {
@@ -410,6 +495,20 @@ func (c *Client) markEndpointFailure(endpointIdx int) {
 		ttl = endpointBlacklistMaxTTL
 	}
 	ep.blacklistedTill = time.Now().Add(ttl)
+	url := ep.url
+	failCount := ep.failCount
+	c.endpointMu.Unlock()
+	// Only log on the healthy → blacklisted transition; subsequent failures
+	// of an already-blacklisted endpoint would be log noise.
+	if wasHealthy {
+		log.Printf("[carrier] endpoint %s blacklisted for %s (still rotating across %d others)",
+			shortScriptKey(url), ttl.Round(100*time.Millisecond), len(c.endpoints)-1)
+	} else if failCount == endpointBlacklistMaxStep+1 {
+		// Notify once when an endpoint hits the maximum backoff step so the
+		// operator knows this deployment is genuinely degraded, not just flaky.
+		log.Printf("[carrier] endpoint %s repeatedly failing (%d consecutive); now at max backoff (%s). Consider re-deploying that script.",
+			shortScriptKey(url), failCount, endpointBlacklistMaxTTL)
+	}
 }
 
 func (c *Client) drainAll() ([]*frame.Frame, [][frame.SessionIDLen]byte) {
@@ -422,17 +521,21 @@ func (c *Client) drainAll() ([]*frame.Frame, [][frame.SessionIDLen]byte) {
 		batchCap = maxDrainFramesPerBatchBusy
 	}
 	remaining := batchCap
-	for id := range c.txReady {
+
+	drain := func(id [frame.SessionIDLen]byte, synOnly bool) {
 		if remaining <= 0 {
-			break
+			return
 		}
 		s, ok := c.sessions[id]
 		if !ok {
 			delete(c.txReady, id)
-			continue
+			return
 		}
 		if c.inFlight[id] {
-			continue // already sending; releaseInFlight will re-add if needed
+			return // already sending; releaseInFlight will re-add if needed
+		}
+		if synOnly && !s.HasPendingSYN() {
+			return
 		}
 		perSessionCap := maxDrainFramesPerSession
 		if remaining < perSessionCap {
@@ -441,12 +544,23 @@ func (c *Client) drainAll() ([]*frame.Frame, [][frame.SessionIDLen]byte) {
 		frames := s.DrainTxLimited(MaxFramePayload, perSessionCap)
 		delete(c.txReady, id) // remove now; OnTx re-adds if more data arrives
 		if len(frames) == 0 {
-			continue
+			return
 		}
 		c.inFlight[id] = true
 		drainedIDs = append(drainedIDs, id)
 		out = append(out, frames...)
 		remaining -= len(frames)
+	}
+
+	// First pass: SYN sessions only. New connections claim batch slots before
+	// ongoing data transfers so a large upload/download cannot push SYN frames
+	// out of the batch and delay connection setup by a full poll cycle.
+	for id := range c.txReady {
+		drain(id, true)
+	}
+	// Second pass: remaining data sessions.
+	for id := range c.txReady {
+		drain(id, false)
 	}
 	return out, drainedIDs
 }
@@ -482,6 +596,8 @@ func (c *Client) routeRx(f *frame.Frame) {
 		delete(c.txReady, f.SessionID)
 		c.mu.Unlock()
 		s.Stop()
+		c.stats.rstFromServer.Add(1)
+		c.stats.sessionsClose.Add(1)
 		return
 	}
 	s.ProcessRx(f)
@@ -495,14 +611,15 @@ func (c *Client) gcDoneSessions() {
 			s.Stop()
 			delete(c.sessions, id)
 			delete(c.txReady, id)
+			c.stats.sessionsClose.Add(1)
 		}
 	}
 }
 
-func (c *Client) acquireIdlePollSlot() bool {
+func (c *Client) acquireIdlePollSlot(cap int) bool {
 	c.idlePollMu.Lock()
 	defer c.idlePollMu.Unlock()
-	if c.idlePollInFlight >= maxConcurrentIdlePolls {
+	if c.idlePollInFlight >= cap {
 		return false
 	}
 	c.idlePollInFlight++

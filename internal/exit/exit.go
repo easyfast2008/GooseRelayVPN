@@ -5,12 +5,14 @@
 package exit
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,7 +37,10 @@ const (
 	LongPollWindow = 8 * time.Second
 
 	// MaxFramePayload caps the bytes per downstream frame (matches carrier).
-	MaxFramePayload = 128 * 1024
+	// Raised from 128KB: single-seal means no per-frame crypto cost, so fewer
+	// larger frames are strictly better (less length-prefix overhead, fewer
+	// Unmarshal calls). Must match the value in internal/carrier/client.go.
+	MaxFramePayload = 256 * 1024
 
 	// upstreamReadBuf is the chunk size for reading from real net.Conn before
 	// pushing to session.EnqueueTx (which then chunks into frames).
@@ -83,10 +88,27 @@ type Server struct {
 
 	mu          sync.Mutex
 	sessions    map[[frame.SessionIDLen]byte]*session.Session
+	txReady     map[[frame.SessionIDLen]byte]struct{} // sessions with pending TX frames
 	dialFail    map[string]time.Time
 	pendingRSTs []*frame.Frame // RST frames to send back on the next response
 
 	activity chan struct{} // buffered len 1; coalesces "session has new tx" signals
+	stats    serverStats
+}
+
+// serverStats holds atomic counters surfaced periodically by runStatsLoop.
+type serverStats struct {
+	requests       atomic.Uint64
+	framesIn       atomic.Uint64
+	framesOut      atomic.Uint64
+	bytesIn        atomic.Uint64
+	bytesOut       atomic.Uint64
+	sessionsOpen   atomic.Uint64
+	sessionsClose  atomic.Uint64
+	dialsOK        atomic.Uint64
+	dialsFail      atomic.Uint64
+	rstSent        atomic.Uint64
+	decodeFailures atomic.Uint64
 }
 
 // New constructs an exit Server.
@@ -100,6 +122,7 @@ func New(cfg Config) (*Server, error) {
 		aead:     aead,
 		dial:     net.DialTimeout,
 		sessions: make(map[[frame.SessionIDLen]byte]*session.Session),
+		txReady:  make(map[[frame.SessionIDLen]byte]struct{}),
 		dialFail: make(map[string]time.Time),
 		activity: make(chan struct{}, 1),
 	}, nil
@@ -121,6 +144,14 @@ func (s *Server) ListenAndServe() error {
 		// up to LongPollWindow to start writing.
 		WriteTimeout: LongPollWindow + 10*time.Second,
 	}
+
+	// Periodic stats line so an operator following journalctl/systemd logs can
+	// see traffic + session health without grepping. Lives for the lifetime of
+	// the HTTP server (cancelled when ListenAndServe returns).
+	statsCtx, cancelStats := context.WithCancel(context.Background())
+	defer cancelStats()
+	go s.runStatsLoop(statsCtx)
+
 	log.Printf("[exit] listening on %s", s.cfg.ListenAddr)
 	return httpSrv.ListenAndServe()
 }
@@ -130,6 +161,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	s.stats.requests.Add(1)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("[exit] read body: %v", err)
@@ -139,9 +171,21 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 	rxFrames, err := frame.DecodeBatch(s.aead, body)
 	if err != nil {
-		log.Printf("[exit] decode batch: %v", err)
+		s.stats.decodeFailures.Add(1)
+		// Decode failure on the very first batch from a client almost always
+		// means the AES key on the client does not match this server's key.
+		log.Printf("[exit] decode batch failed: %v (likely tunnel_key mismatch — confirm client config matches this server's tunnel_key)", err)
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+
+	if len(rxFrames) > 0 {
+		var bytesIn uint64
+		for _, f := range rxFrames {
+			bytesIn += uint64(len(f.Payload))
+		}
+		s.stats.framesIn.Add(uint64(len(rxFrames)))
+		s.stats.bytesIn.Add(bytesIn)
 	}
 
 	for _, f := range rxFrames {
@@ -183,6 +227,12 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
+			var bytesOut uint64
+			for _, f := range txFrames {
+				bytesOut += uint64(len(f.Payload))
+			}
+			s.stats.framesOut.Add(uint64(len(txFrames)))
+			s.stats.bytesOut.Add(bytesOut)
 			w.Header().Set("Content-Type", "text/plain")
 			_, _ = w.Write(respBody)
 			s.gcDoneSessions()
@@ -230,6 +280,7 @@ func (s *Server) routeIncoming(f *frame.Frame) {
 			s.mu.Lock()
 			s.pendingRSTs = append(s.pendingRSTs, rst)
 			s.mu.Unlock()
+			s.stats.rstSent.Add(1)
 			s.kick()
 			return
 		}
@@ -238,6 +289,7 @@ func (s *Server) routeIncoming(f *frame.Frame) {
 			s.mu.Lock()
 			s.pendingRSTs = append(s.pendingRSTs, rst)
 			s.mu.Unlock()
+			s.stats.rstSent.Add(1)
 			s.kick()
 			return
 		}
@@ -245,9 +297,11 @@ func (s *Server) routeIncoming(f *frame.Frame) {
 		sess, err = s.openSession(f.SessionID, f.Target)
 		if err != nil {
 			s.recordDialFailure(f.Target, err)
+			s.stats.dialsFail.Add(1)
 			log.Printf("[exit] dial %s: %v", f.Target, err)
 			return
 		}
+		s.stats.dialsOK.Add(1)
 		s.clearDialFailure(f.Target)
 	}
 	sess.ProcessRx(f)
@@ -261,11 +315,17 @@ func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*sessi
 		return nil, err
 	}
 	sess := session.New(id, target, false)
-	sess.OnTx = s.kick
+	sess.OnTx = func() {
+		s.mu.Lock()
+		s.txReady[id] = struct{}{}
+		s.mu.Unlock()
+		s.kick()
+	}
 
 	s.mu.Lock()
 	s.sessions[id] = sess
 	s.mu.Unlock()
+	s.stats.sessionsOpen.Add(1)
 
 	log.Printf("[exit] new session %x -> %s", id[:4], target)
 
@@ -316,15 +376,21 @@ func (s *Server) drainAll() []*frame.Frame {
 		batchCap = maxDrainFramesPerBatchBusy
 	}
 	remaining := batchCap
-	for _, sess := range s.sessions {
+	for id := range s.txReady {
 		if remaining <= 0 {
 			break
+		}
+		sess, ok := s.sessions[id]
+		if !ok {
+			delete(s.txReady, id)
+			continue
 		}
 		perSessionCap := maxDrainFramesPerSession
 		if remaining < perSessionCap {
 			perSessionCap = remaining
 		}
 		frames := sess.DrainTxLimited(MaxFramePayload, perSessionCap)
+		delete(s.txReady, id) // OnTx re-adds if more data arrives
 		out = append(out, frames...)
 		remaining -= len(frames)
 	}
@@ -338,6 +404,8 @@ func (s *Server) gcDoneSessions() {
 		if sess.IsDone() {
 			sess.Stop()
 			delete(s.sessions, id)
+			delete(s.txReady, id)
+			s.stats.sessionsClose.Add(1)
 		}
 	}
 }
