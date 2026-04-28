@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -33,8 +34,9 @@ func (c *Client) logStats() {
 	c.mu.Unlock()
 
 	healthy, total := c.endpointHealthCounts()
+	endpointDetail := c.endpointStatsLine()
 
-	log.Printf("[stats] active=%d sessions(open=%d close=%d) frames(out=%d in=%d) bytes(out=%s in=%s) polls(ok=%d fail=%d) rst=%d endpoints=%d/%d_healthy",
+	log.Printf("[stats] active=%d sessions(open=%d close=%d) frames(out=%d in=%d) bytes(out=%s in=%s) polls(ok=%d fail=%d) rst=%d endpoints=%d/%d_healthy endpoints=[%s]",
 		active,
 		c.stats.sessionsOpen.Load(), c.stats.sessionsClose.Load(),
 		c.stats.framesOut.Load(), c.stats.framesIn.Load(),
@@ -42,6 +44,7 @@ func (c *Client) logStats() {
 		c.stats.pollsOK.Load(), c.stats.pollsFail.Load(),
 		c.stats.rstFromServer.Load(),
 		healthy, total,
+		endpointDetail,
 	)
 }
 
@@ -56,6 +59,25 @@ func (c *Client) endpointHealthCounts() (healthy, total int) {
 		}
 	}
 	return
+}
+
+func (c *Client) endpointStatsLine() string {
+	c.endpointMu.Lock()
+	defer c.endpointMu.Unlock()
+	if len(c.endpoints) == 0 {
+		return "none"
+	}
+	now := time.Now()
+	parts := make([]string, 0, len(c.endpoints))
+	for _, ep := range c.endpoints {
+		part := fmt.Sprintf("%s ok=%d fail=%d", shortScriptKey(ep.url), ep.statsOK, ep.statsFail)
+		if ep.blacklistedTill.After(now) {
+			remaining := time.Until(ep.blacklistedTill).Round(time.Second)
+			part = fmt.Sprintf("%s bl=%s", part, remaining)
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, " | ")
 }
 
 // humanBytes formats a byte count as a short human-readable string. Used for

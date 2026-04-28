@@ -52,8 +52,7 @@ const (
 	// Endpoint failure backoff to shed unhealthy deployments during quota spikes
 	// or tail-latency events without changing protocol behavior.
 	endpointBlacklistBaseTTL = 3 * time.Second
-	endpointBlacklistMaxTTL  = 48 * time.Second
-	endpointBlacklistMaxStep = 4
+	endpointBlacklistMaxTTL  = 1 * time.Hour
 )
 
 // Config bundles everything the carrier needs to talk to the relay.
@@ -68,6 +67,8 @@ type relayEndpoint struct {
 	url             string
 	blacklistedTill time.Time
 	failCount       int
+	statsOK         uint64
+	statsFail       uint64
 }
 
 // numPollWorkers is the number of concurrent poll goroutines. Multiple
@@ -499,6 +500,7 @@ func (c *Client) markEndpointSuccess(endpointIdx int) {
 	}
 	ep := &c.endpoints[endpointIdx]
 	wasFailing := ep.failCount > 0
+	ep.statsOK++
 	url := ep.url
 	ep.failCount = 0
 	ep.blacklistedTill = time.Time{}
@@ -517,14 +519,8 @@ func (c *Client) markEndpointFailure(endpointIdx int) {
 	ep := &c.endpoints[endpointIdx]
 	wasHealthy := ep.failCount == 0
 	ep.failCount++
-	step := ep.failCount - 1
-	if step > endpointBlacklistMaxStep {
-		step = endpointBlacklistMaxStep
-	}
-	ttl := endpointBlacklistBaseTTL << step
-	if ttl > endpointBlacklistMaxTTL {
-		ttl = endpointBlacklistMaxTTL
-	}
+	ep.statsFail++
+	ttl := endpointBlacklistTTL(ep.failCount)
 	ep.blacklistedTill = time.Now().Add(ttl)
 	url := ep.url
 	failCount := ep.failCount
@@ -534,11 +530,28 @@ func (c *Client) markEndpointFailure(endpointIdx int) {
 	if wasHealthy {
 		log.Printf("[carrier] endpoint %s blacklisted for %s (still rotating across %d others)",
 			shortScriptKey(url), ttl.Round(100*time.Millisecond), len(c.endpoints)-1)
-	} else if failCount == endpointBlacklistMaxStep+1 {
-		// Notify once when an endpoint hits the maximum backoff step so the
-		// operator knows this deployment is genuinely degraded, not just flaky.
-		log.Printf("[carrier] endpoint %s repeatedly failing (%d consecutive); now at max backoff (%s). Consider re-deploying that script.",
-			shortScriptKey(url), failCount, endpointBlacklistMaxTTL)
+	} else if failCount == 8 {
+		// Notify once when an endpoint reaches hour-scale backoff so the operator
+		// knows this deployment is likely quota-exhausted or dead.
+		log.Printf("[carrier] endpoint %s repeatedly failing (%d consecutive); now at extended backoff (%s). Consider re-deploying that script.",
+			shortScriptKey(url), failCount, ttl.Round(time.Second))
+	}
+}
+
+func endpointBlacklistTTL(failCount int) time.Duration {
+	if failCount <= 0 {
+		return 0
+	}
+	if failCount <= 5 {
+		return endpointBlacklistBaseTTL << (failCount - 1)
+	}
+	switch failCount {
+	case 6:
+		return 5 * time.Minute
+	case 7:
+		return 30 * time.Minute
+	default:
+		return endpointBlacklistMaxTTL
 	}
 }
 
