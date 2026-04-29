@@ -65,8 +65,17 @@ const (
 
 	// Endpoint failure backoff to shed unhealthy deployments during quota spikes
 	// or tail-latency events without changing protocol behavior.
+	//
+	// Cap reduced from 1h to 5m after the production cascade observed on
+	// 2026-04-29: a per-source-IP throttle at Google's edge made both Apps
+	// Script deployments return HTML interstitials simultaneously, which the
+	// previous 1h cap turned into a self-pinning DoS — every fail rolled the
+	// blacklist deadline forward another hour. With a 5m cap, plus monotonic
+	// blacklist updates and worker-sleep-until-expiry below, a transient
+	// throttle clears within ~5 minutes instead of forcing the user to wait
+	// out the full hour-long backoff.
 	endpointBlacklistBaseTTL = 3 * time.Second
-	endpointBlacklistMaxTTL  = 1 * time.Hour
+	endpointBlacklistMaxTTL  = 5 * time.Minute
 )
 
 // Config bundles everything the carrier needs to talk to the relay.
@@ -91,7 +100,30 @@ type relayEndpoint struct {
 	ewmaRTT     time.Duration
 	lastSuccess time.Time
 	firstFail   time.Time // when the most recent failure streak began
+
+	// loggedNonBatchSnippetAt rate-limits the diagnostic body-snippet
+	// log so a sustained failure stream produces at most one snippet
+	// per loggedNonBatchSnippetCooldown — enough to identify the root
+	// cause (quota page, SSO interstitial, dead deployment) without
+	// flooding the log with the same snippet thousands of times.
+	loggedNonBatchSnippetAt time.Time
+
+	// disabledReason is set when a failure class indicates the endpoint
+	// will never recover within this session (e.g. HTTP 403). Non-empty
+	// means the endpoint is permanently skipped by pickRelayEndpoint.
+	disabledReason string
+
+	// quotaBlacklistedTill is used for quota-exhausted endpoints — a
+	// much longer hold (1h) than the normal transient backoff so we
+	// don't burn probes against a deployment that won't recover until
+	// midnight Pacific.
+	quotaBlacklistedTill time.Time
 }
+
+// loggedNonBatchSnippetCooldown is how long an endpoint waits before logging
+// another body snippet. Operators want to see what changed (e.g. throttle
+// page → quota page) without log spam.
+const loggedNonBatchSnippetCooldown = 30 * time.Second
 
 // workersPerEndpoint is the number of concurrent poll goroutines spawned for
 // each configured script URL. Total workers = workersPerEndpoint × len(endpoints).
@@ -110,6 +142,38 @@ const ewmaRTTAlpha = 0.2
 // evidence the deployment is dead/misconfigured and the per-failure backoff
 // already maxes out at endpointBlacklistMaxTTL anyway.
 const permanentDisableAfter = 24 * time.Hour
+
+// noEligibleEndpointSleep bounds how long a worker waits between checks for
+// an eligible endpoint when *all* endpoints are blacklisted, so a recovering
+// endpoint is detected within this window even if its scheduled blacklist
+// deadline lies much further out. Keeps recovery interactive without
+// hammering throttled endpoints.
+const noEligibleEndpointSleep = 30 * time.Second
+
+// quotaExhaustedBlacklist is the blacklist duration applied when Apps Script
+// returns a "daily quota exceeded" error. URL Fetch quota resets at midnight
+// Pacific; retrying every 5 minutes wastes quota probes without hope of
+// success. 1 hour is aggressive enough to notice a reset without hammering.
+const quotaExhaustedBlacklist = 1 * time.Hour
+
+// endpointFailureClass describes how severe a poll failure is so the caller
+// can choose an appropriate backoff.
+type endpointFailureClass int
+
+const (
+	// failClassTransient is a generic/unknown failure — normal escalating
+	// backoff (3s → 6s → … → 5m cap).
+	failClassTransient endpointFailureClass = iota
+
+	// failClassQuotaExhausted means Apps Script's daily URL Fetch quota is
+	// hit. No point retrying for ~1 hour.
+	failClassQuotaExhausted
+
+	// failClassForbidden means HTTP 403 — the deployment is not public or
+	// the deployment ID is wrong. Will never recover without redeployment;
+	// disable for the session.
+	failClassForbidden
+)
 
 // waker is a broadcast notifier: Broadcast() wakes all goroutines currently
 // blocked on C() simultaneously, unlike a buffered chan which only wakes one.
@@ -321,23 +385,38 @@ func (c *Client) Shutdown(ctx context.Context) {
 		return
 	}
 
-	_, scriptURL := c.pickRelayEndpoint()
-	if scriptURL == "" {
+	// Shutdown is best-effort: try each endpoint in order, ignoring
+	// blacklist state, until one accepts the RST batch. We deliberately
+	// bypass pickRelayEndpoint() here because every endpoint may be
+	// blacklisted (this is exactly the production scenario that triggered
+	// the cascade) and the server's idle GC is the safety net if all
+	// sends fail.
+	c.endpointMu.Lock()
+	urls := make([]string, len(c.endpoints))
+	for i, e := range c.endpoints {
+		urls[i] = e.url
+	}
+	c.endpointMu.Unlock()
+	if len(urls) == 0 {
 		return
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, scriptURL, bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "text/plain")
 
 	log.Printf("[carrier] shutdown: sending RST for %d active sessions", len(rsts))
-	resp, err := c.pickHTTPClient().Do(req)
-	if err != nil {
-		log.Printf("[carrier] shutdown: send failed (server idle GC will clean up): %v", err)
-		return
+	for _, scriptURL := range urls {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, scriptURL, bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "text/plain")
+		resp, err := c.pickHTTPClient().Do(req)
+		if err != nil {
+			log.Printf("[carrier] shutdown: send via %s failed: %v", shortScriptKey(scriptURL), err)
+			continue
+		}
+		_ = resp.Body.Close()
+		return // first success wins
 	}
-	_ = resp.Body.Close()
+	log.Printf("[carrier] shutdown: all %d endpoints failed (server idle GC will clean up)", len(urls))
 }
 
 // prewarmEndpoints fires one short-deadline HEAD per endpoint in parallel so
@@ -442,6 +521,23 @@ func (c *Client) runWorker(ctx context.Context) {
 				// this when an OnTx callback fires.
 				sleep = pollIdleSleepHot
 			}
+			// If every endpoint is blacklisted, sleep until the soonest
+			// blacklist expires (capped at noEligibleEndpointSleep). Without
+			// this, six workers would spin in a tight loop calling
+			// pickRelayEndpoint() → (-1, "") → returning false from pollOnce
+			// → sleeping pollIdleSleep (50ms) → looping again. That's the
+			// CPU-burn / log-spam side of the production cascade. With this
+			// branch, the loop quiesces to one wake every 30s (or earlier on
+			// session activity / blacklist expiry).
+			if soonest := c.earliestEligibleAt(); !soonest.IsZero() {
+				wait := time.Until(soonest)
+				if wait > noEligibleEndpointSleep {
+					wait = noEligibleEndpointSleep
+				}
+				if wait > sleep {
+					sleep = wait
+				}
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -457,6 +553,23 @@ func (c *Client) runWorker(ctx context.Context) {
 // response frames back to their sessions. Returns true if any work was done
 // (frames sent or received) so the Run loop can decide whether to sleep.
 func (c *Client) pollOnce(ctx context.Context) bool {
+	// Check endpoint eligibility BEFORE draining frames. If every endpoint
+	// is blacklisted, return immediately without popping frames out of
+	// session tx queues — they'd be lost (no requeue path back into the
+	// session's per-stream sequence ordering). Frames stay in the session's
+	// txBuf and get drained next time an endpoint recovers.
+	//
+	// This is also the gate that quiesces the worker loop during a
+	// throttle event: pollOnce returns false → runWorker sees nothing
+	// eligible → sleeps until earliestEligibleAt() instead of spinning.
+	endpointIdx, scriptURL, eligibleCount := c.pickRelayEndpointWithEligibility()
+	if endpointIdx < 0 || scriptURL == "" {
+		if len(c.endpoints) == 0 {
+			log.Printf("[carrier] no relay script URLs are configured")
+		}
+		return false
+	}
+
 	frames, drainedIDs := c.drainAll()
 	if len(drainedIDs) > 0 {
 		defer c.releaseInFlight(drainedIDs)
@@ -503,17 +616,21 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 	}
 
 	maxAttempts := 1
-	if len(c.endpoints) > 1 {
-		// One same-poll failover attempt keeps drained TX payload from being lost
-		// when one deployment intermittently fails under quota pressure.
+	if eligibleCount > 1 {
+		// Same-poll alternate-script failover only makes sense when there's
+		// at least one OTHER eligible endpoint to fall back to. Retrying onto
+		// a blacklisted endpoint just compounds the failure cascade without
+		// any chance of success.
 		maxAttempts = 2
 	}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		endpointIdx, scriptURL := c.pickRelayEndpoint()
-		if endpointIdx < 0 || scriptURL == "" {
-			log.Printf("[carrier] no relay script URLs are configured")
-			return false
+		if attempt > 1 {
+			endpointIdx, scriptURL = c.pickRelayEndpoint()
+			if endpointIdx < 0 || scriptURL == "" {
+				// Alternate became blacklisted between attempts; bail.
+				return false
+			}
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, scriptURL, bytes.NewReader(body))
@@ -568,7 +685,13 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 			return len(frames) > 0
 		}
 		if resp.StatusCode != http.StatusOK {
-			c.markEndpointFailure(endpointIdx)
+			class := classifyRelayFailure(resp.StatusCode, respBody)
+			c.markEndpointFailureClassified(endpointIdx, class)
+			if class == failClassForbidden || class == failClassQuotaExhausted {
+				// Don't retry on the alternate — these are endpoint-specific
+				// permanent/long-hold issues, not transient network glitches.
+				return false
+			}
 			if attempt < maxAttempts {
 				log.Printf("[carrier] relay returned HTTP %d via %s (attempt %d/%d); retrying alternate script", resp.StatusCode, shortScriptKey(scriptURL), attempt, maxAttempts)
 				continue
@@ -586,7 +709,18 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 			return len(frames) > 0
 		}
 		if isLikelyNonBatchRelayPayload(respBody) {
-			c.markEndpointFailure(endpointIdx)
+			// On the healthy → non-batch transition, log a snippet of the
+			// actual response body so the operator can identify whether it's
+			// an Apps Script quota page, a Google interstitial, an
+			// "unauthorized" SSO redirect, or a misdeployed script. Without
+			// this, the only signal was "(likely HTML/JSON error page)" which
+			// gives the operator zero diagnostic data.
+			c.maybeLogRelayBodySnippet(endpointIdx, scriptURL, respBody)
+			class := classifyRelayFailure(resp.StatusCode, respBody)
+			c.markEndpointFailureClassified(endpointIdx, class)
+			if class == failClassForbidden || class == failClassQuotaExhausted {
+				return len(frames) > 0
+			}
 			if attempt < maxAttempts {
 				log.Printf("[carrier] relay returned non-batch payload via %s (attempt %d/%d); retrying alternate script", shortScriptKey(scriptURL), attempt, maxAttempts)
 				continue
@@ -654,13 +788,32 @@ func (c *Client) pickHTTPClient() *http.Client {
 	return c.httpClients[idx%uint64(len(c.httpClients))]
 }
 
+// pickRelayEndpoint selects an eligible endpoint or returns (-1, "") if
+// none are currently eligible (all blacklisted or permanently disabled).
+//
+// CRITICAL: never returns a blacklisted endpoint. The previous "pick whose
+// backoff expires soonest as a last resort" fallback caused the 2026-04-29
+// cascade — under a per-source-IP edge throttle, the fallback poll always
+// failed, which compounded markEndpointFailure() and pinned both endpoints
+// at 1h blacklist indefinitely. The caller is expected to treat (-1, "")
+// as "sleep until earliestEligibleAt() returns a non-zero time".
 func (c *Client) pickRelayEndpoint() (int, string) {
+	idx, url, _ := c.pickRelayEndpointWithEligibility()
+	return idx, url
+}
+
+// pickRelayEndpointWithEligibility is the same as pickRelayEndpoint but
+// also returns the count of currently-eligible endpoints so the caller
+// can decide whether the same-poll alternate-script retry (maxAttempts=2)
+// is worth attempting. Retrying onto a blacklisted endpoint just compounds
+// the cascade without any chance of success.
+func (c *Client) pickRelayEndpointWithEligibility() (int, string, int) {
 	c.endpointMu.Lock()
 	defer c.endpointMu.Unlock()
 
 	n := len(c.endpoints)
 	if n == 0 {
-		return -1, ""
+		return -1, "", 0
 	}
 	now := time.Now()
 
@@ -674,6 +827,15 @@ func (c *Client) pickRelayEndpoint() (int, string) {
 	eligible := make([]int, 0, n)
 	for i := 0; i < n; i++ {
 		ep := &c.endpoints[i]
+		// Session-disabled (e.g. HTTP 403 — never recovers without redeploy).
+		if ep.disabledReason != "" {
+			continue
+		}
+		// Quota-exhausted — held for quotaExhaustedBlacklist (1h).
+		if ep.quotaBlacklistedTill.After(now) {
+			continue
+		}
+		// Normal transient blacklist.
 		if ep.blacklistedTill.After(now) {
 			continue
 		}
@@ -683,23 +845,12 @@ func (c *Client) pickRelayEndpoint() (int, string) {
 		eligible = append(eligible, i)
 	}
 	if len(eligible) == 0 {
-		// All endpoints blacklisted or permanently disabled — pick the one
-		// whose backoff expires soonest as a last resort.
-		chosen := 0
-		soonest := c.endpoints[0].blacklistedTill
-		for i := 1; i < n; i++ {
-			if c.endpoints[i].blacklistedTill.Before(soonest) {
-				chosen = i
-				soonest = c.endpoints[i].blacklistedTill
-			}
-		}
-		c.nextEndpoint = (chosen + 1) % n
-		return chosen, c.endpoints[chosen].url
+		return -1, "", 0
 	}
 	if len(eligible) == 1 {
 		idx := eligible[0]
 		c.nextEndpoint = (idx + 1) % n
-		return idx, c.endpoints[idx].url
+		return idx, c.endpoints[idx].url, 1
 	}
 	// Power-of-two-choices: random sample two distinct candidates and pick
 	// whichever has the lower EWMA RTT. If neither has been measured yet
@@ -708,7 +859,7 @@ func (c *Client) pickRelayEndpoint() (int, string) {
 	b := eligible[(c.nextEndpoint+1)%len(eligible)]
 	if a == b {
 		c.nextEndpoint = (a + 1) % n
-		return a, c.endpoints[a].url
+		return a, c.endpoints[a].url, len(eligible)
 	}
 	rttA := c.endpoints[a].ewmaRTT
 	rttB := c.endpoints[b].ewmaRTT
@@ -726,7 +877,43 @@ func (c *Client) pickRelayEndpoint() (int, string) {
 		chosen = b
 	}
 	c.nextEndpoint = (chosen + 1) % n
-	return chosen, c.endpoints[chosen].url
+	return chosen, c.endpoints[chosen].url, len(eligible)
+}
+
+// earliestEligibleAt returns the earliest time at which at least one
+// endpoint will become eligible again, or the zero time if any endpoint is
+// already eligible. Permanently-disabled endpoints are skipped — if every
+// endpoint is permanently disabled, returns the zero time too (the caller
+// will keep sleeping at the bounded ceiling rather than block forever).
+func (c *Client) earliestEligibleAt() time.Time {
+	c.endpointMu.Lock()
+	defer c.endpointMu.Unlock()
+	now := time.Now()
+	var soonest time.Time
+	for i := range c.endpoints {
+		ep := &c.endpoints[i]
+		// Session-disabled endpoints never recover; skip them.
+		if ep.disabledReason != "" {
+			continue
+		}
+		if !ep.firstFail.IsZero() && now.Sub(ep.firstFail) > permanentDisableAfter && ep.lastSuccess.Before(ep.firstFail) {
+			continue
+		}
+		// Check quota blacklist first (longer hold).
+		if ep.quotaBlacklistedTill.After(now) {
+			if soonest.IsZero() || ep.quotaBlacklistedTill.Before(soonest) {
+				soonest = ep.quotaBlacklistedTill
+			}
+			continue
+		}
+		if !ep.blacklistedTill.After(now) {
+			return time.Time{} // at least one eligible right now
+		}
+		if soonest.IsZero() || ep.blacklistedTill.Before(soonest) {
+			soonest = ep.blacklistedTill
+		}
+	}
+	return soonest
 }
 
 // markEndpointSuccessRTT records a success and updates the per-endpoint
@@ -767,14 +954,24 @@ func (c *Client) markEndpointFailure(endpointIdx int) {
 		return
 	}
 	ep := &c.endpoints[endpointIdx]
+	now := time.Now()
 	wasHealthy := ep.failCount == 0
 	ep.failCount++
 	ep.statsFail++
 	if ep.firstFail.IsZero() {
-		ep.firstFail = time.Now()
+		ep.firstFail = now
 	}
+	// Monotonic blacklist: only extend the deadline forward. Without this,
+	// every fail rolled the deadline to now+ttl, so any worker that polled a
+	// blacklisted endpoint pinned it at the max TTL indefinitely. With
+	// pickRelayEndpoint() now refusing to return blacklisted endpoints, this
+	// is also defense-in-depth against future regressions that re-introduce
+	// the fallback.
 	ttl := endpointBlacklistTTL(ep.failCount)
-	ep.blacklistedTill = time.Now().Add(ttl)
+	newDeadline := now.Add(ttl)
+	if newDeadline.After(ep.blacklistedTill) {
+		ep.blacklistedTill = newDeadline
+	}
 	url := ep.url
 	failCount := ep.failCount
 	c.endpointMu.Unlock()
@@ -784,11 +981,87 @@ func (c *Client) markEndpointFailure(endpointIdx int) {
 		log.Printf("[carrier] endpoint %s blacklisted for %s (still rotating across %d others)",
 			shortScriptKey(url), ttl.Round(100*time.Millisecond), len(c.endpoints)-1)
 	} else if failCount == 8 {
-		// Notify once when an endpoint reaches hour-scale backoff so the operator
-		// knows this deployment is likely quota-exhausted or dead.
-		log.Printf("[carrier] endpoint %s repeatedly failing (%d consecutive); now at extended backoff (%s). Consider re-deploying that script.",
+		// Notify once when an endpoint repeatedly hits the max-cap backoff so
+		// the operator knows this deployment is likely quota-exhausted or dead.
+		log.Printf("[carrier] endpoint %s repeatedly failing (%d consecutive); now at capped backoff (%s). Consider re-deploying that script or checking source-IP rate limits at Google's edge.",
 			shortScriptKey(url), failCount, ttl.Round(time.Second))
 	}
+}
+
+// markEndpointFailureClassified applies the right blacklist duration based on
+// the failure class detected by classifyRelayFailure. For transient failures
+// it falls through to the normal markEndpointFailure. For quota/forbidden it
+// applies longer holds and logs clear operator guidance.
+func (c *Client) markEndpointFailureClassified(endpointIdx int, class endpointFailureClass) {
+	switch class {
+	case failClassForbidden:
+		c.endpointMu.Lock()
+		if endpointIdx >= 0 && endpointIdx < len(c.endpoints) {
+			ep := &c.endpoints[endpointIdx]
+			if ep.disabledReason == "" {
+				ep.disabledReason = "HTTP 403 Forbidden"
+				ep.statsFail++
+				url := ep.url
+				c.endpointMu.Unlock()
+				healthy, quota, disabled := c.endpointStatusCounts()
+				log.Printf("[carrier] endpoint %s DISABLED for this session: HTTP 403 — deployment is not set to 'Anyone' or the Deployment ID is wrong. Re-deploy with public access to fix.", shortScriptKey(url))
+				log.Printf("[carrier] endpoint status: %d healthy, %d quota-exhausted (1h hold), %d disabled — %d total", healthy, quota, disabled, len(c.endpoints))
+				return
+			}
+		}
+		c.endpointMu.Unlock()
+
+	case failClassQuotaExhausted:
+		c.endpointMu.Lock()
+		if endpointIdx >= 0 && endpointIdx < len(c.endpoints) {
+			ep := &c.endpoints[endpointIdx]
+			now := time.Now()
+			// Only log on the first quota detection for this endpoint.
+			wasQuota := ep.quotaBlacklistedTill.After(now)
+			ep.quotaBlacklistedTill = now.Add(quotaExhaustedBlacklist)
+			ep.statsFail++
+			ep.failCount++
+			if ep.firstFail.IsZero() {
+				ep.firstFail = now
+			}
+			url := ep.url
+			c.endpointMu.Unlock()
+			if !wasQuota {
+				healthy, quota, disabled := c.endpointStatusCounts()
+				log.Printf("[carrier] endpoint %s quota-exhausted: blacklisted 1h (daily Apps Script urlfetch limit hit; resets ~midnight Pacific). Consider deploying under a different Google account for independent quota.", shortScriptKey(url))
+				log.Printf("[carrier] endpoint status: %d healthy, %d quota-exhausted (1h hold), %d disabled — %d total", healthy, quota, disabled, len(c.endpoints))
+			}
+			return
+		}
+		c.endpointMu.Unlock()
+
+	default:
+		// Transient — normal escalating backoff.
+		c.markEndpointFailure(endpointIdx)
+	}
+}
+
+// endpointStatusCounts returns the number of healthy, quota-held, and
+// session-disabled endpoints for operator-facing status messages.
+func (c *Client) endpointStatusCounts() (healthy, quota, disabled int) {
+	c.endpointMu.Lock()
+	defer c.endpointMu.Unlock()
+	now := time.Now()
+	for i := range c.endpoints {
+		ep := &c.endpoints[i]
+		if ep.disabledReason != "" {
+			disabled++
+		} else if ep.quotaBlacklistedTill.After(now) {
+			quota++
+		} else if ep.blacklistedTill.After(now) {
+			// transient blacklist — still counted as "not healthy" for now,
+			// but they'll recover shortly so we group them with healthy.
+			healthy++
+		} else {
+			healthy++
+		}
+	}
+	return
 }
 
 func endpointBlacklistTTL(failCount int) time.Duration {
@@ -796,16 +1069,17 @@ func endpointBlacklistTTL(failCount int) time.Duration {
 		return 0
 	}
 	if failCount <= 5 {
-		return endpointBlacklistBaseTTL << (failCount - 1)
+		ttl := endpointBlacklistBaseTTL << (failCount - 1)
+		if ttl > endpointBlacklistMaxTTL {
+			return endpointBlacklistMaxTTL
+		}
+		return ttl
 	}
-	switch failCount {
-	case 6:
-		return 5 * time.Minute
-	case 7:
-		return 30 * time.Minute
-	default:
-		return endpointBlacklistMaxTTL
-	}
+	// failCount=6+: cap at endpointBlacklistMaxTTL (5 min). Faster
+	// recovery from transient per-source-IP throttles than the previous
+	// 30min/1h ramp, which turned a 5-minute Apps Script throttle into
+	// an hour of degraded service.
+	return endpointBlacklistMaxTTL
 }
 
 func (c *Client) drainAll() ([]*frame.Frame, [][frame.SessionIDLen]byte) {
@@ -995,6 +1269,79 @@ func isLikelyNonBatchRelayPayload(body []byte) bool {
 		return true
 	}
 	return false
+}
+
+// classifyRelayFailure inspects the HTTP status and response body to decide
+// whether a failure is transient (normal backoff), quota-exhausted (1h hold),
+// or permanently broken (session-disable). Called from pollOnce after a
+// non-OK response is read.
+func classifyRelayFailure(statusCode int, body []byte) endpointFailureClass {
+	if statusCode == http.StatusForbidden {
+		return failClassForbidden
+	}
+	// Apps Script quota errors embed "urlfetch" (the quota category name)
+	// in the body. Works regardless of locale because the quota service
+	// name is not translated — only the surrounding prose is.
+	lower := bytes.ToLower(body)
+	if bytes.Contains(lower, []byte("urlfetch")) {
+		return failClassQuotaExhausted
+	}
+	// Broader heuristic: any mention of daily quota in known languages.
+	if bytes.Contains(lower, []byte("daily quota")) ||
+		bytes.Contains(lower, []byte("exceeded")) ||
+		bytes.Contains(lower, []byte("quota")) && bytes.Contains(lower, []byte("limit")) {
+		return failClassQuotaExhausted
+	}
+	return failClassTransient
+}
+
+// maybeLogRelayBodySnippet logs the first ~800 chars of a non-batch
+// response body to help the operator identify what Apps Script is actually
+// returning (quota page vs SSO redirect vs dead deployment vs Google
+// interstitial). Rate-limited per endpoint to avoid log flooding under
+// sustained failure: at most one snippet per loggedNonBatchSnippetCooldown.
+//
+// Output is ASCII-clean (control chars stripped), so a binary blob doesn't
+// trash the operator's terminal.
+func (c *Client) maybeLogRelayBodySnippet(endpointIdx int, scriptURL string, body []byte) {
+	c.endpointMu.Lock()
+	if endpointIdx < 0 || endpointIdx >= len(c.endpoints) {
+		c.endpointMu.Unlock()
+		return
+	}
+	ep := &c.endpoints[endpointIdx]
+	now := time.Now()
+	if !ep.loggedNonBatchSnippetAt.IsZero() && now.Sub(ep.loggedNonBatchSnippetAt) < loggedNonBatchSnippetCooldown {
+		c.endpointMu.Unlock()
+		return
+	}
+	ep.loggedNonBatchSnippetAt = now
+	c.endpointMu.Unlock()
+
+	// Show up to 800 chars. If the body contains a <body> tag, skip
+	// everything before it so the operator sees the error message text
+	// instead of <head> CSS/nonce boilerplate.
+	t := bytes.TrimSpace(body)
+	if idx := bytes.Index(bytes.ToLower(t), []byte("<body")); idx >= 0 {
+		t = t[idx:]
+	}
+	const maxLen = 800
+	if len(t) > maxLen {
+		t = t[:maxLen]
+	}
+	out := make([]byte, 0, len(t)+3)
+	for _, ch := range t {
+		if ch < 0x20 || ch == 0x7f {
+			out = append(out, ' ')
+			continue
+		}
+		out = append(out, ch)
+	}
+	if len(body) > maxLen {
+		out = append(out, '.', '.', '.')
+	}
+	log.Printf("[carrier] non-batch body via %s (%d bytes total): %s",
+		shortScriptKey(scriptURL), len(body), string(out))
 }
 
 func shortScriptKey(scriptURL string) string {
