@@ -216,3 +216,115 @@ func TestCarrier_FailsOverToHealthyScriptURLWithoutTxLoss(t *testing.T) {
 		t.Fatal("Run() did not return after cancel")
 	}
 }
+
+// TestCarrier_AllEndpointsBlacklistedQuiesces verifies the production
+// regression fix: when every endpoint is currently blacklisted,
+// pickRelayEndpoint returns -1 and pollOnce bails without burning a poll.
+// Without this, the client spun in a tight loop polling blacklisted
+// endpoints, every fail rolling the deadline forward another hour and
+// pinning both endpoints at the max TTL indefinitely.
+func TestCarrier_AllEndpointsBlacklistedQuiesces(t *testing.T) {
+	c, err := New(Config{
+		ScriptURLs: []string{"https://example.invalid/a", "https://example.invalid/b"},
+		AESKeyHex:  testKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	c.endpointMu.Lock()
+	for i := range c.endpoints {
+		c.endpoints[i].blacklistedTill = time.Now().Add(5 * time.Minute)
+		c.endpoints[i].failCount = 8
+	}
+	c.endpointMu.Unlock()
+
+	idx, url, eligible := c.pickRelayEndpointWithEligibility()
+	if idx >= 0 || url != "" || eligible != 0 {
+		t.Fatalf("expected (-1, \"\", 0) when all blacklisted, got (%d, %q, %d)", idx, url, eligible)
+	}
+
+	if didWork := c.pollOnce(context.Background()); didWork {
+		t.Fatal("expected pollOnce to return false when all endpoints blacklisted")
+	}
+
+	if at := c.earliestEligibleAt(); at.IsZero() {
+		t.Fatal("earliestEligibleAt should be non-zero when all blacklisted")
+	}
+}
+
+// TestCarrier_BlacklistMonotonic verifies markEndpointFailure does NOT
+// roll a steady deadline forward by another full TTL on every failure —
+// the bug that pinned both endpoints at the max blacklist indefinitely
+// under sustained throttle.
+func TestCarrier_BlacklistMonotonic(t *testing.T) {
+	c, err := New(Config{
+		ScriptURLs: []string{"https://example.invalid/a"},
+		AESKeyHex:  testKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	c.endpointMu.Lock()
+	c.endpoints[0].failCount = 7
+	c.endpointMu.Unlock()
+
+	c.markEndpointFailure(0)
+	c.endpointMu.Lock()
+	first := c.endpoints[0].blacklistedTill
+	c.endpointMu.Unlock()
+
+	time.Sleep(2 * time.Millisecond)
+	c.markEndpointFailure(0)
+	c.endpointMu.Lock()
+	second := c.endpoints[0].blacklistedTill
+	c.endpointMu.Unlock()
+
+	delta := second.Sub(first)
+	if delta > 50*time.Millisecond {
+		t.Fatalf("blacklist deadline jumped %v on second failure (should be monotonic & bounded by elapsed time)", delta)
+	}
+}
+
+// TestCarrier_BlacklistMaxTTLReduced ensures the cap is short enough that
+// transient throttles recover within minutes, not hours.
+func TestCarrier_BlacklistMaxTTLReduced(t *testing.T) {
+	if endpointBlacklistMaxTTL > 10*time.Minute {
+		t.Fatalf("endpointBlacklistMaxTTL=%s; should be ≤10min so transient throttles recover quickly", endpointBlacklistMaxTTL)
+	}
+	for fc := 1; fc <= 20; fc++ {
+		ttl := endpointBlacklistTTL(fc)
+		if ttl > endpointBlacklistMaxTTL {
+			t.Fatalf("failCount=%d ttl=%s exceeds cap %s", fc, ttl, endpointBlacklistMaxTTL)
+		}
+	}
+}
+
+// TestCarrier_RetryAlternateOnlyWhenEligible verifies maxAttempts is
+// pinned at 1 when only a single endpoint is eligible, even if the
+// endpoint list has multiple URLs. Retrying onto a blacklisted alternate
+// just compounds the cascade.
+func TestCarrier_RetryAlternateOnlyWhenEligible(t *testing.T) {
+	c, err := New(Config{
+		ScriptURLs: []string{"https://example.invalid/a", "https://example.invalid/b"},
+		AESKeyHex:  testKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	// Blacklist endpoint 1; endpoint 0 is healthy.
+	c.endpointMu.Lock()
+	c.endpoints[1].blacklistedTill = time.Now().Add(5 * time.Minute)
+	c.endpoints[1].failCount = 8
+	c.endpointMu.Unlock()
+
+	idx, url, eligible := c.pickRelayEndpointWithEligibility()
+	if idx != 0 || url != c.endpoints[0].url {
+		t.Fatalf("expected idx=0, got %d url=%q", idx, url)
+	}
+	if eligible != 1 {
+		t.Fatalf("expected eligible=1 (only one not-blacklisted endpoint), got %d", eligible)
+	}
+}
