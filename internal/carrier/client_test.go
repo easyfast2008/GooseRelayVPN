@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -326,5 +327,108 @@ func TestCarrier_RetryAlternateOnlyWhenEligible(t *testing.T) {
 	}
 	if eligible != 1 {
 		t.Fatalf("expected eligible=1 (only one not-blacklisted endpoint), got %d", eligible)
+	}
+}
+
+// TestClassifyRelayFailure_Forbidden verifies HTTP 403 is classified as
+// session-permanent, regardless of body content.
+func TestClassifyRelayFailure_Forbidden(t *testing.T) {
+	class := classifyRelayFailure(403, []byte("anything"))
+	if class != failClassForbidden {
+		t.Fatalf("expected failClassForbidden, got %d", class)
+	}
+}
+
+// TestClassifyRelayFailure_Quota verifies body-based quota detection works
+// across locales (the "urlfetch" keyword is never localized by Apps Script).
+func TestClassifyRelayFailure_Quota(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"english", "Service invoked too many times for one day: urlfetch."},
+		{"persian", "Exception: سرویس در طول یک روز به دفعات زیاد فراخوان شده است:urlfetch. (خط 16)"},
+		{"just_keyword", "urlfetch quota limit reached"},
+		{"daily_quota", "You have exceeded your daily quota for this service"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			class := classifyRelayFailure(200, []byte(tc.body))
+			if class != failClassQuotaExhausted {
+				t.Fatalf("expected failClassQuotaExhausted for body %q, got %d", tc.body, class)
+			}
+		})
+	}
+}
+
+// TestClassifyRelayFailure_Transient verifies generic HTML error pages fall
+// through to normal backoff.
+func TestClassifyRelayFailure_Transient(t *testing.T) {
+	class := classifyRelayFailure(200, []byte("<html><body>generic error</body></html>"))
+	if class != failClassTransient {
+		t.Fatalf("expected failClassTransient, got %d", class)
+	}
+}
+
+// TestCarrier_QuotaEndpointSkipped verifies that a quota-exhausted endpoint
+// is excluded from pickRelayEndpoint and shows in the stats line.
+func TestCarrier_QuotaEndpointSkipped(t *testing.T) {
+	c, err := New(Config{
+		ScriptURLs: []string{"https://example.invalid/a", "https://example.invalid/b"},
+		AESKeyHex:  testKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	// Mark endpoint 0 as quota-exhausted.
+	c.endpointMu.Lock()
+	c.endpoints[0].quotaBlacklistedTill = time.Now().Add(1 * time.Hour)
+	c.endpointMu.Unlock()
+
+	// Pick should always return endpoint 1.
+	for i := 0; i < 10; i++ {
+		idx, _, eligible := c.pickRelayEndpointWithEligibility()
+		if idx != 1 {
+			t.Fatalf("iteration %d: expected idx=1 (skip quota endpoint), got %d", i, idx)
+		}
+		if eligible != 1 {
+			t.Fatalf("iteration %d: expected eligible=1, got %d", i, eligible)
+		}
+	}
+
+	// Stats line should show QUOTA_HOLD.
+	line := c.endpointStatsLine()
+	if !strings.Contains(line, "QUOTA_HOLD=") {
+		t.Fatalf("stats line should contain QUOTA_HOLD=, got: %s", line)
+	}
+}
+
+// TestCarrier_DisabledEndpointSkipped verifies that a 403-disabled endpoint
+// is permanently excluded from selection and shows DISABLED in stats.
+func TestCarrier_DisabledEndpointSkipped(t *testing.T) {
+	c, err := New(Config{
+		ScriptURLs: []string{"https://example.invalid/a", "https://example.invalid/b"},
+		AESKeyHex:  testKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	// Disable endpoint 0.
+	c.endpointMu.Lock()
+	c.endpoints[0].disabledReason = "HTTP 403 Forbidden"
+	c.endpointMu.Unlock()
+
+	for i := 0; i < 10; i++ {
+		idx, _, _ := c.pickRelayEndpointWithEligibility()
+		if idx != 1 {
+			t.Fatalf("iteration %d: expected idx=1 (skip disabled), got %d", i, idx)
+		}
+	}
+
+	line := c.endpointStatsLine()
+	if !strings.Contains(line, "DISABLED(") {
+		t.Fatalf("stats line should contain DISABLED(, got: %s", line)
 	}
 }

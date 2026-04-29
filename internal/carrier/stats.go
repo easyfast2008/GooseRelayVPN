@@ -54,6 +54,12 @@ func (c *Client) endpointHealthCounts() (healthy, total int) {
 	now := time.Now()
 	total = len(c.endpoints)
 	for _, ep := range c.endpoints {
+		if ep.disabledReason != "" {
+			continue
+		}
+		if ep.quotaBlacklistedTill.After(now) {
+			continue
+		}
 		if !ep.blacklistedTill.After(now) {
 			healthy++
 		}
@@ -71,7 +77,12 @@ func (c *Client) endpointStatsLine() string {
 	parts := make([]string, 0, len(c.endpoints))
 	for _, ep := range c.endpoints {
 		part := fmt.Sprintf("%s ok=%d fail=%d", shortScriptKey(ep.url), ep.statsOK, ep.statsFail)
-		if ep.blacklistedTill.After(now) {
+		if ep.disabledReason != "" {
+			part = fmt.Sprintf("%s DISABLED(%s)", part, ep.disabledReason)
+		} else if ep.quotaBlacklistedTill.After(now) {
+			remaining := time.Until(ep.quotaBlacklistedTill).Round(time.Second)
+			part = fmt.Sprintf("%s QUOTA_HOLD=%s", part, remaining)
+		} else if ep.blacklistedTill.After(now) {
 			remaining := time.Until(ep.blacklistedTill).Round(time.Second)
 			part = fmt.Sprintf("%s bl=%s", part, remaining)
 		}

@@ -107,6 +107,17 @@ type relayEndpoint struct {
 	// cause (quota page, SSO interstitial, dead deployment) without
 	// flooding the log with the same snippet thousands of times.
 	loggedNonBatchSnippetAt time.Time
+
+	// disabledReason is set when a failure class indicates the endpoint
+	// will never recover within this session (e.g. HTTP 403). Non-empty
+	// means the endpoint is permanently skipped by pickRelayEndpoint.
+	disabledReason string
+
+	// quotaBlacklistedTill is used for quota-exhausted endpoints — a
+	// much longer hold (1h) than the normal transient backoff so we
+	// don't burn probes against a deployment that won't recover until
+	// midnight Pacific.
+	quotaBlacklistedTill time.Time
 }
 
 // loggedNonBatchSnippetCooldown is how long an endpoint waits before logging
@@ -138,6 +149,31 @@ const permanentDisableAfter = 24 * time.Hour
 // deadline lies much further out. Keeps recovery interactive without
 // hammering throttled endpoints.
 const noEligibleEndpointSleep = 30 * time.Second
+
+// quotaExhaustedBlacklist is the blacklist duration applied when Apps Script
+// returns a "daily quota exceeded" error. URL Fetch quota resets at midnight
+// Pacific; retrying every 5 minutes wastes quota probes without hope of
+// success. 1 hour is aggressive enough to notice a reset without hammering.
+const quotaExhaustedBlacklist = 1 * time.Hour
+
+// endpointFailureClass describes how severe a poll failure is so the caller
+// can choose an appropriate backoff.
+type endpointFailureClass int
+
+const (
+	// failClassTransient is a generic/unknown failure — normal escalating
+	// backoff (3s → 6s → … → 5m cap).
+	failClassTransient endpointFailureClass = iota
+
+	// failClassQuotaExhausted means Apps Script's daily URL Fetch quota is
+	// hit. No point retrying for ~1 hour.
+	failClassQuotaExhausted
+
+	// failClassForbidden means HTTP 403 — the deployment is not public or
+	// the deployment ID is wrong. Will never recover without redeployment;
+	// disable for the session.
+	failClassForbidden
+)
 
 // waker is a broadcast notifier: Broadcast() wakes all goroutines currently
 // blocked on C() simultaneously, unlike a buffered chan which only wakes one.
@@ -649,7 +685,13 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 			return len(frames) > 0
 		}
 		if resp.StatusCode != http.StatusOK {
-			c.markEndpointFailure(endpointIdx)
+			class := classifyRelayFailure(resp.StatusCode, respBody)
+			c.markEndpointFailureClassified(endpointIdx, class)
+			if class == failClassForbidden || class == failClassQuotaExhausted {
+				// Don't retry on the alternate — these are endpoint-specific
+				// permanent/long-hold issues, not transient network glitches.
+				return false
+			}
 			if attempt < maxAttempts {
 				log.Printf("[carrier] relay returned HTTP %d via %s (attempt %d/%d); retrying alternate script", resp.StatusCode, shortScriptKey(scriptURL), attempt, maxAttempts)
 				continue
@@ -674,7 +716,11 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 			// this, the only signal was "(likely HTML/JSON error page)" which
 			// gives the operator zero diagnostic data.
 			c.maybeLogRelayBodySnippet(endpointIdx, scriptURL, respBody)
-			c.markEndpointFailure(endpointIdx)
+			class := classifyRelayFailure(resp.StatusCode, respBody)
+			c.markEndpointFailureClassified(endpointIdx, class)
+			if class == failClassForbidden || class == failClassQuotaExhausted {
+				return len(frames) > 0
+			}
 			if attempt < maxAttempts {
 				log.Printf("[carrier] relay returned non-batch payload via %s (attempt %d/%d); retrying alternate script", shortScriptKey(scriptURL), attempt, maxAttempts)
 				continue
@@ -781,6 +827,15 @@ func (c *Client) pickRelayEndpointWithEligibility() (int, string, int) {
 	eligible := make([]int, 0, n)
 	for i := 0; i < n; i++ {
 		ep := &c.endpoints[i]
+		// Session-disabled (e.g. HTTP 403 — never recovers without redeploy).
+		if ep.disabledReason != "" {
+			continue
+		}
+		// Quota-exhausted — held for quotaExhaustedBlacklist (1h).
+		if ep.quotaBlacklistedTill.After(now) {
+			continue
+		}
+		// Normal transient blacklist.
 		if ep.blacklistedTill.After(now) {
 			continue
 		}
@@ -837,11 +892,22 @@ func (c *Client) earliestEligibleAt() time.Time {
 	var soonest time.Time
 	for i := range c.endpoints {
 		ep := &c.endpoints[i]
+		// Session-disabled endpoints never recover; skip them.
+		if ep.disabledReason != "" {
+			continue
+		}
 		if !ep.firstFail.IsZero() && now.Sub(ep.firstFail) > permanentDisableAfter && ep.lastSuccess.Before(ep.firstFail) {
 			continue
 		}
+		// Check quota blacklist first (longer hold).
+		if ep.quotaBlacklistedTill.After(now) {
+			if soonest.IsZero() || ep.quotaBlacklistedTill.Before(soonest) {
+				soonest = ep.quotaBlacklistedTill
+			}
+			continue
+		}
 		if !ep.blacklistedTill.After(now) {
-			return time.Time{}
+			return time.Time{} // at least one eligible right now
 		}
 		if soonest.IsZero() || ep.blacklistedTill.Before(soonest) {
 			soonest = ep.blacklistedTill
@@ -920,6 +986,82 @@ func (c *Client) markEndpointFailure(endpointIdx int) {
 		log.Printf("[carrier] endpoint %s repeatedly failing (%d consecutive); now at capped backoff (%s). Consider re-deploying that script or checking source-IP rate limits at Google's edge.",
 			shortScriptKey(url), failCount, ttl.Round(time.Second))
 	}
+}
+
+// markEndpointFailureClassified applies the right blacklist duration based on
+// the failure class detected by classifyRelayFailure. For transient failures
+// it falls through to the normal markEndpointFailure. For quota/forbidden it
+// applies longer holds and logs clear operator guidance.
+func (c *Client) markEndpointFailureClassified(endpointIdx int, class endpointFailureClass) {
+	switch class {
+	case failClassForbidden:
+		c.endpointMu.Lock()
+		if endpointIdx >= 0 && endpointIdx < len(c.endpoints) {
+			ep := &c.endpoints[endpointIdx]
+			if ep.disabledReason == "" {
+				ep.disabledReason = "HTTP 403 Forbidden"
+				ep.statsFail++
+				url := ep.url
+				c.endpointMu.Unlock()
+				healthy, quota, disabled := c.endpointStatusCounts()
+				log.Printf("[carrier] endpoint %s DISABLED for this session: HTTP 403 — deployment is not set to 'Anyone' or the Deployment ID is wrong. Re-deploy with public access to fix.", shortScriptKey(url))
+				log.Printf("[carrier] endpoint status: %d healthy, %d quota-exhausted (1h hold), %d disabled — %d total", healthy, quota, disabled, len(c.endpoints))
+				return
+			}
+		}
+		c.endpointMu.Unlock()
+
+	case failClassQuotaExhausted:
+		c.endpointMu.Lock()
+		if endpointIdx >= 0 && endpointIdx < len(c.endpoints) {
+			ep := &c.endpoints[endpointIdx]
+			now := time.Now()
+			// Only log on the first quota detection for this endpoint.
+			wasQuota := ep.quotaBlacklistedTill.After(now)
+			ep.quotaBlacklistedTill = now.Add(quotaExhaustedBlacklist)
+			ep.statsFail++
+			ep.failCount++
+			if ep.firstFail.IsZero() {
+				ep.firstFail = now
+			}
+			url := ep.url
+			c.endpointMu.Unlock()
+			if !wasQuota {
+				healthy, quota, disabled := c.endpointStatusCounts()
+				log.Printf("[carrier] endpoint %s quota-exhausted: blacklisted 1h (daily Apps Script urlfetch limit hit; resets ~midnight Pacific). Consider deploying under a different Google account for independent quota.", shortScriptKey(url))
+				log.Printf("[carrier] endpoint status: %d healthy, %d quota-exhausted (1h hold), %d disabled — %d total", healthy, quota, disabled, len(c.endpoints))
+			}
+			return
+		}
+		c.endpointMu.Unlock()
+
+	default:
+		// Transient — normal escalating backoff.
+		c.markEndpointFailure(endpointIdx)
+	}
+}
+
+// endpointStatusCounts returns the number of healthy, quota-held, and
+// session-disabled endpoints for operator-facing status messages.
+func (c *Client) endpointStatusCounts() (healthy, quota, disabled int) {
+	c.endpointMu.Lock()
+	defer c.endpointMu.Unlock()
+	now := time.Now()
+	for i := range c.endpoints {
+		ep := &c.endpoints[i]
+		if ep.disabledReason != "" {
+			disabled++
+		} else if ep.quotaBlacklistedTill.After(now) {
+			quota++
+		} else if ep.blacklistedTill.After(now) {
+			// transient blacklist — still counted as "not healthy" for now,
+			// but they'll recover shortly so we group them with healthy.
+			healthy++
+		} else {
+			healthy++
+		}
+	}
+	return
 }
 
 func endpointBlacklistTTL(failCount int) time.Duration {
@@ -1129,7 +1271,31 @@ func isLikelyNonBatchRelayPayload(body []byte) bool {
 	return false
 }
 
-// maybeLogRelayBodySnippet logs the first ~200 chars of a non-batch
+// classifyRelayFailure inspects the HTTP status and response body to decide
+// whether a failure is transient (normal backoff), quota-exhausted (1h hold),
+// or permanently broken (session-disable). Called from pollOnce after a
+// non-OK response is read.
+func classifyRelayFailure(statusCode int, body []byte) endpointFailureClass {
+	if statusCode == http.StatusForbidden {
+		return failClassForbidden
+	}
+	// Apps Script quota errors embed "urlfetch" (the quota category name)
+	// in the body. Works regardless of locale because the quota service
+	// name is not translated — only the surrounding prose is.
+	lower := bytes.ToLower(body)
+	if bytes.Contains(lower, []byte("urlfetch")) {
+		return failClassQuotaExhausted
+	}
+	// Broader heuristic: any mention of daily quota in known languages.
+	if bytes.Contains(lower, []byte("daily quota")) ||
+		bytes.Contains(lower, []byte("exceeded")) ||
+		bytes.Contains(lower, []byte("quota")) && bytes.Contains(lower, []byte("limit")) {
+		return failClassQuotaExhausted
+	}
+	return failClassTransient
+}
+
+// maybeLogRelayBodySnippet logs the first ~800 chars of a non-batch
 // response body to help the operator identify what Apps Script is actually
 // returning (quota page vs SSO redirect vs dead deployment vs Google
 // interstitial). Rate-limited per endpoint to avoid log flooding under
