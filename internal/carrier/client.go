@@ -320,12 +320,14 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 	}
 	isIdlePoll := len(frames) == 0
 	if isIdlePoll {
-		// Allow one idle long-poll slot per endpoint so each deployment can push
-		// downstream data concurrently. In pure-download mode (no pending TX)
-		// raise the cap to numWorkers-1 so most workers are long-polling for
-		// higher bulk throughput, reserving one for any TX that arrives.
+		// Keep at most one idle long-poll in flight so the remaining workers are
+		// always available to pick up outbound TX within one pollIdleSleep (50ms).
+		// The VPS pushes data on whichever poll is open regardless of endpoint, so
+		// one slot is sufficient for downstream push across all deployments.
+		// In pure-download mode (no pending TX) raise the cap so most workers are
+		// long-polling concurrently for higher bulk throughput.
 		c.mu.Lock()
-		idleCap := len(c.endpoints)
+		idleCap := 1
 		if len(c.txReady) == 0 {
 			idleCap = c.numWorkers - 1
 		}
