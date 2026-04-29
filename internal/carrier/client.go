@@ -1152,8 +1152,14 @@ func (c *Client) maybeLogRelayBodySnippet(endpointIdx int, scriptURL string, bod
 	ep.loggedNonBatchSnippetAt = now
 	c.endpointMu.Unlock()
 
-	const maxLen = 200
+	// Show up to 800 chars. If the body contains a <body> tag, skip
+	// everything before it so the operator sees the error message text
+	// instead of <head> CSS/nonce boilerplate.
 	t := bytes.TrimSpace(body)
+	if idx := bytes.Index(bytes.ToLower(t), []byte("<body")); idx >= 0 {
+		t = t[idx:]
+	}
+	const maxLen = 800
 	if len(t) > maxLen {
 		t = t[:maxLen]
 	}
